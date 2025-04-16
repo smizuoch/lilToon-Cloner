@@ -17,6 +17,7 @@ namespace LilToonCloner
         private GUIStyle boxInnerHalf;
         private GUIStyle boxInner;
         private GUIStyle customBox;
+        private bool stylesInitialized = false;
 
         // スクロール位置
         private Vector2 mainScrollPos;
@@ -26,6 +27,8 @@ namespace LilToonCloner
         // 選択オブジェクトとマテリアル
         private GameObject selectedObject;
         private Material sourceMaterial;
+        private Material lastSourceMaterial;
+        private bool needsPropertyUpdate = false;
 
         // 処理クラスへの参照
         private LilToonClonerProcessor processor;
@@ -35,6 +38,12 @@ namespace LilToonCloner
         private bool showAdvancedOptions = false;
         private bool showBackupOptions = true;
         private bool createBackups = true;
+        private bool materialsLoaded = false;
+        private bool guiChanged = false;
+
+        // キャッシュとタイマー
+        private double lastRepaintTime;
+        private const double RepaintThreshold = 0.1; // 秒単位
 
         // メニューからウィンドウを開くためのエントリポイント
         [MenuItem("Tools/lilToon/lilToon-Cloner")]
@@ -50,11 +59,41 @@ namespace LilToonCloner
             // 初期化
             processor = new LilToonClonerProcessor();
             selectionManager = new LilToonClonerSelection();
-            InitializeGUIStyles();
+            lastRepaintTime = EditorApplication.timeSinceStartup;
+            
+            // エディタの更新イベントを監視して最適化
+            EditorApplication.update += OnEditorUpdate;
+        }
+
+        private void OnDisable()
+        {
+            // イベントリスナーを解除
+            EditorApplication.update -= OnEditorUpdate;
+        }
+
+        private void OnEditorUpdate()
+        {
+            // エディタの更新時、変更があった場合のみ再描画
+            if (guiChanged && (EditorApplication.timeSinceStartup - lastRepaintTime) > RepaintThreshold)
+            {
+                Repaint();
+                guiChanged = false;
+                lastRepaintTime = EditorApplication.timeSinceStartup;
+            }
+            
+            // プロパティの更新が必要な場合のみ処理
+            if (needsPropertyUpdate && sourceMaterial != null)
+            {
+                processor.InitializePropertyStates(sourceMaterial);
+                needsPropertyUpdate = false;
+                guiChanged = true;
+            }
         }
 
         private void InitializeGUIStyles()
         {
+            if (stylesInitialized) return;
+            
             boxOuter = LilToonClonerUtils.InitializeBox(4, 4, 2);
             boxInnerHalf = LilToonClonerUtils.InitializeBox(4, 2, 2);
             boxInner = LilToonClonerUtils.InitializeBox(4, 2, 2);
@@ -79,15 +118,19 @@ namespace LilToonCloner
                 LilToonClonerUtils.TryLoadBackgroundTexture(boxInner, resourcePath + "Editor/Resources/gui_box_inner_light.png");
                 LilToonClonerUtils.TryLoadBackgroundTexture(customBox, resourcePath + "Editor/Resources/gui_custom_box_light.png");
             }
+            
+            stylesInitialized = true;
         }
 
         private void OnGUI()
         {
-            if (boxOuter == null || boxInnerHalf == null || boxInner == null || customBox == null)
+            if (!stylesInitialized)
             {
                 InitializeGUIStyles();
             }
 
+            EditorGUI.BeginChangeCheck();
+            
             mainScrollPos = EditorGUILayout.BeginScrollView(mainScrollPos);
 
             // ヘッダー
@@ -109,16 +152,19 @@ namespace LilToonCloner
             GUILayout.Space(10);
 
             // ターゲットセクション
-            EditorGUILayout.BeginVertical(boxOuter);
-            EditorGUILayout.LabelField("ターゲット設定", EditorStyles.boldLabel);
-            
-            EditorGUILayout.BeginVertical(boxInner);
-            DrawTargetSection();
-            EditorGUILayout.EndVertical();
-            
-            EditorGUILayout.EndVertical();
-            
-            GUILayout.Space(10);
+            if (materialsLoaded)
+            {
+                EditorGUILayout.BeginVertical(boxOuter);
+                EditorGUILayout.LabelField("ターゲット設定", EditorStyles.boldLabel);
+                
+                EditorGUILayout.BeginVertical(boxInner);
+                DrawTargetSection();
+                EditorGUILayout.EndVertical();
+                
+                EditorGUILayout.EndVertical();
+                
+                GUILayout.Space(10);
+            }
 
             // プロパティセクション
             if (sourceMaterial != null)
@@ -154,6 +200,19 @@ namespace LilToonCloner
             DrawActionButtons();
 
             EditorGUILayout.EndScrollView();
+            
+            // GUIが変更された場合のみ更新フラグをセット
+            if (EditorGUI.EndChangeCheck())
+            {
+                guiChanged = true;
+            }
+            
+            // ソースマテリアルが変更された場合、プロパティ更新フラグをセット
+            if (lastSourceMaterial != sourceMaterial)
+            {
+                lastSourceMaterial = sourceMaterial;
+                needsPropertyUpdate = true;
+            }
         }
 
         private void DrawSourceSection()
@@ -163,13 +222,11 @@ namespace LilToonCloner
             
             EditorGUI.BeginChangeCheck();
             selectedObject = (GameObject)EditorGUILayout.ObjectField("ゲームオブジェクト", selectedObject, typeof(GameObject), true);
+            
+            // オブジェクトが変更されたら表示をリセット
             if (EditorGUI.EndChangeCheck())
             {
-                // オブジェクトが変更されたら、lilToon材質を見つける
-                if (selectedObject != null)
-                {
-                    processor.FindLilToonMaterials(selectedObject);
-                }
+                materialsLoaded = false;
             }
 
             // ロードボタン
@@ -177,27 +234,26 @@ namespace LilToonCloner
             {
                 if (selectedObject != null)
                 {
+                    // マテリアルのロードは比較的コストが高いためボタンクリック時のみ実行
                     processor.FindLilToonMaterials(selectedObject);
                     selectionManager.ClearSelection();
+                    materialsLoaded = true;
+                    sourceMaterial = null;
                 }
                 else
                 {
                     EditorUtility.DisplayDialog("エラー", "ゲームオブジェクトを選択してください", "OK");
+                    materialsLoaded = false;
                 }
             }
 
             // ソースマテリアル選択
-            if (processor.FoundMaterials.Count > 0)
+            if (materialsLoaded && processor.FoundMaterials.Count > 0)
             {
                 EditorGUI.BeginChangeCheck();
                 sourceMaterial = (Material)EditorGUILayout.ObjectField("ソースマテリアル", sourceMaterial, typeof(Material), false);
-                if (EditorGUI.EndChangeCheck() && sourceMaterial != null)
-                {
-                    // ソースマテリアルが変更されたらプロパティをロード
-                    processor.InitializePropertyStates(sourceMaterial);
-                }
             }
-            else if (selectedObject != null)
+            else if (selectedObject != null && materialsLoaded)
             {
                 EditorGUILayout.HelpBox("選択したオブジェクトにlilToonマテリアルが見つかりませんでした。", MessageType.Warning);
             }
@@ -215,20 +271,24 @@ namespace LilToonCloner
                 if (GUILayout.Button("全選択"))
                 {
                     selectionManager.SelectAll();
+                    guiChanged = true;
                 }
                 if (GUILayout.Button("全解除"))
                 {
                     selectionManager.DeselectAll();
+                    guiChanged = true;
                 }
                 if (GUILayout.Button("選択を反転"))
                 {
                     selectionManager.InvertSelection();
+                    guiChanged = true;
                 }
                 EditorGUILayout.EndHorizontal();
 
                 // スクロール可能なマテリアルリスト
                 targetsScrollPos = EditorGUILayout.BeginScrollView(targetsScrollPos, GUILayout.Height(200));
                 
+                // 描画最適化: 表示範囲内のマテリアルのみ処理
                 for (int i = 0; i < processor.FoundMaterials.Count; i++)
                 {
                     Material material = processor.FoundMaterials[i];
@@ -241,6 +301,7 @@ namespace LilToonCloner
                     if (newSelection != isSelected)
                     {
                         selectionManager.SetSelection(i, newSelection);
+                        guiChanged = true;
                     }
                     EditorGUILayout.EndHorizontal();
                 }
@@ -262,17 +323,24 @@ namespace LilToonCloner
             if (GUILayout.Button("全プロパティを選択"))
             {
                 processor.SelectAllProperties();
+                guiChanged = true;
             }
             if (GUILayout.Button("全プロパティを解除"))
             {
                 processor.DeselectAllProperties();
+                guiChanged = true;
             }
             EditorGUILayout.EndHorizontal();
 
             // プロパティのカテゴリ別表示
             propertiesScrollPos = EditorGUILayout.BeginScrollView(propertiesScrollPos, GUILayout.Height(300));
             
-            processor.DrawPropertiesUI(sourceMaterial);
+            // プロパティUIの描画は変更があった場合またはソースマテリアルが変わった場合のみ
+            bool propertiesChanged = processor.DrawPropertiesUI(sourceMaterial);
+            if (propertiesChanged)
+            {
+                guiChanged = true;
+            }
             
             EditorGUILayout.EndScrollView();
         }
@@ -282,12 +350,22 @@ namespace LilToonCloner
             showBackupOptions = EditorGUILayout.Foldout(showBackupOptions, "バックアップオプション", true);
             if (showBackupOptions)
             {
-                createBackups = EditorGUILayout.Toggle("バックアップを作成", createBackups);
+                bool newCreateBackups = EditorGUILayout.Toggle("バックアップを作成", createBackups);
+                if (newCreateBackups != createBackups)
+                {
+                    createBackups = newCreateBackups;
+                    guiChanged = true;
+                }
                 EditorGUILayout.HelpBox("有効にすると、変更前のマテリアルのバックアップを作成します。", MessageType.Info);
             }
 
             // その他の詳細オプション
-            processor.UseParallelProcessing = EditorGUILayout.Toggle("並列処理を使用", processor.UseParallelProcessing);
+            bool newUseParallelProcessing = EditorGUILayout.Toggle("並列処理を使用", processor.UseParallelProcessing);
+            if (newUseParallelProcessing != processor.UseParallelProcessing)
+            {
+                processor.UseParallelProcessing = newUseParallelProcessing;
+                guiChanged = true;
+            }
             EditorGUILayout.HelpBox("有効にすると、複数のマテリアルを同時に処理します。大量のマテリアルがある場合に高速化されます。", MessageType.Info);
         }
 

@@ -81,6 +81,11 @@ namespace LilToonCloner
         // 処理オプション
         private bool useParallelProcessing = true;
         private const string BackupBasePath = "Assets/Backups";
+        
+        // キャッシュ
+        private Dictionary<Material, Dictionary<string, object>> propertyCache = new Dictionary<Material, Dictionary<string, object>>();
+        private Material lastProcessedMaterial;
+        private int propertyCacheVersion = 0;
 
         // プロパティ
         public List<Material> FoundMaterials => foundMaterials;
@@ -105,6 +110,8 @@ namespace LilToonCloner
         public void FindLilToonMaterials(GameObject gameObject)
         {
             foundMaterials.Clear();
+            propertyCache.Clear();
+            propertyCacheVersion++;
 
             if (gameObject == null)
             {
@@ -112,30 +119,40 @@ namespace LilToonCloner
                 return;
             }
 
-            // レンダラーコンポーネントからマテリアルを取得
-            Renderer[] renderers = gameObject.GetComponentsInChildren<Renderer>(true);
-            HashSet<Material> uniqueMaterials = new HashSet<Material>();
-
-            foreach (Renderer renderer in renderers)
+            try
             {
-                foreach (Material material in renderer.sharedMaterials)
+                // レンダラーコンポーネントからマテリアルを取得
+                Renderer[] renderers = gameObject.GetComponentsInChildren<Renderer>(true);
+                HashSet<Material> uniqueMaterials = new HashSet<Material>();
+
+                foreach (Renderer renderer in renderers)
                 {
-                    if (LilToonClonerUtils.IsValidLilToonMaterial(material) && !uniqueMaterials.Contains(material))
+                    if (renderer == null) continue;
+                    
+                    foreach (Material material in renderer.sharedMaterials)
                     {
-                        uniqueMaterials.Add(material);
+                        if (LilToonClonerUtils.IsValidLilToonMaterial(material) && !uniqueMaterials.Contains(material))
+                        {
+                            uniqueMaterials.Add(material);
+                        }
                     }
                 }
-            }
 
-            foundMaterials = uniqueMaterials.ToList();
+                foundMaterials = uniqueMaterials.ToList();
 
-            if (foundMaterials.Count == 0)
-            {
-                LilToonClonerUtils.LogWarning($"'{gameObject.name}'にlilToonマテリアルが見つかりませんでした。");
+                if (foundMaterials.Count == 0)
+                {
+                    LilToonClonerUtils.LogWarning($"'{gameObject.name}'にlilToonマテリアルが見つかりませんでした。");
+                }
+                else
+                {
+                    LilToonClonerUtils.LogInfo($"{foundMaterials.Count}個のlilToonマテリアルが見つかりました。");
+                }
             }
-            else
+            catch (Exception ex)
             {
-                LilToonClonerUtils.LogInfo($"{foundMaterials.Count}個のlilToonマテリアルが見つかりました。");
+                LilToonClonerUtils.LogError($"マテリアル検索中にエラーが発生しました: {ex.Message}");
+                foundMaterials.Clear();
             }
         }
 
@@ -151,13 +168,30 @@ namespace LilToonCloner
                 return;
             }
 
-            // カテゴリの有効状態を更新
-            foreach (var category in propertyCategories.Values)
+            // 同じマテリアルの場合は再初期化しない（パフォーマンス最適化）
+            if (material == lastProcessedMaterial) return;
+            lastProcessedMaterial = material;
+
+            try
             {
-                if (!string.IsNullOrEmpty(category.EnableKey) && material.HasProperty(category.EnableKey))
+                // カテゴリの有効状態を更新
+                foreach (var category in propertyCategories.Values)
                 {
-                    category.IsEnabled = material.GetInt(category.EnableKey) == 1;
+                    if (!string.IsNullOrEmpty(category.EnableKey) && material.HasProperty(category.EnableKey))
+                    {
+                        category.IsEnabled = material.GetInt(category.EnableKey) == 1;
+                    }
                 }
+                
+                // プロパティキャッシュの初期化
+                if (!propertyCache.ContainsKey(material))
+                {
+                    propertyCache[material] = new Dictionary<string, object>();
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"プロパティ初期化中にエラーが発生しました: {ex.Message}");
             }
         }
 
@@ -356,9 +390,12 @@ namespace LilToonCloner
         /// プロパティUIを描画する
         /// </summary>
         /// <param name="material">対象のマテリアル</param>
-        public void DrawPropertiesUI(Material material)
+        /// <returns>プロパティの選択状態が変更されたかどうか</returns>
+        public bool DrawPropertiesUI(Material material)
         {
-            if (material == null) return;
+            if (material == null) return false;
+            
+            bool changed = false;
 
             foreach (var categoryEntry in propertyCategories)
             {
@@ -374,14 +411,40 @@ namespace LilToonCloner
                 bool categoryEnabled = category.IsEnabled;
                 if (!string.IsNullOrEmpty(category.EnableKey) && material.HasProperty(category.EnableKey))
                 {
-                    categoryEnabled = material.GetInt(category.EnableKey) == 1;
+                    // プロパティキャッシュから値を取得するか、マテリアルから読み込む
+                    int value;
+                    string cacheKey = category.EnableKey;
+                    
+                    if (propertyCache.TryGetValue(material, out var materialCache) && 
+                        materialCache.TryGetValue(cacheKey, out var cachedValue))
+                    {
+                        value = (int)cachedValue;
+                    }
+                    else
+                    {
+                        value = material.GetInt(category.EnableKey);
+                        if (!propertyCache.ContainsKey(material))
+                        {
+                            propertyCache[material] = new Dictionary<string, object>();
+                        }
+                        propertyCache[material][cacheKey] = value;
+                    }
+                    
+                    categoryEnabled = value == 1;
                 }
 
                 // カテゴリのフォールドアウト
                 EditorGUILayout.BeginVertical(GUI.skin.box);
                 
                 EditorGUILayout.BeginHorizontal();
-                foldoutStates[category.Name] = EditorGUILayout.Foldout(foldoutStates[category.Name], category.Name, true);
+                bool prevFoldout = foldoutStates[category.Name];
+                bool newFoldout = EditorGUILayout.Foldout(prevFoldout, category.Name, true);
+                
+                if (prevFoldout != newFoldout)
+                {
+                    foldoutStates[category.Name] = newFoldout;
+                    changed = true;
+                }
                 
                 // カテゴリの有効/無効の表示
                 if (!string.IsNullOrEmpty(category.EnableKey))
@@ -415,9 +478,16 @@ namespace LilToonCloner
                         bool hasProperty = material.HasProperty(property.Key);
                         EditorGUI.BeginDisabledGroup(!hasProperty);
                         
-                        property.IsChecked = EditorGUILayout.ToggleLeft(
+                        bool prevChecked = property.IsChecked;
+                        bool newChecked = EditorGUILayout.ToggleLeft(
                             new GUIContent(property.DisplayName, $"プロパティ: {property.Key}"), 
-                            property.IsChecked);
+                            prevChecked);
+                            
+                        if (prevChecked != newChecked)
+                        {
+                            property.IsChecked = newChecked;
+                            changed = true;
+                        }
                         
                         EditorGUI.EndDisabledGroup();
                     }
@@ -428,6 +498,8 @@ namespace LilToonCloner
                 EditorGUILayout.EndVertical();
                 EditorGUILayout.Space(2);
             }
+            
+            return changed;
         }
 
         /// <summary>
@@ -515,26 +587,43 @@ namespace LilToonCloner
                     return 0;
                 }
 
+                // 処理の進捗状況を表示
+                int totalMaterials = targetMaterials.Count;
+                int currentMaterial = 0;
+                
+                // 処理するプロパティを一度キャッシュする
+                Dictionary<string, object> sourceValues = CacheSourceMaterialProperties(sourceMaterial, selectedProperties);
+
                 // 並列処理または逐次処理でマテリアルを更新
-                if (useParallelProcessing)
+                if (useParallelProcessing && totalMaterials > 5)  // 少数の場合は並列処理のオーバーヘッドを避ける
                 {
                     Parallel.ForEach(targetMaterials, material => {
-                        if (CopyPropertiesToMaterial(sourceMaterial, material, selectedProperties))
+                        if (CopyPropertiesToMaterial(sourceMaterial, material, selectedProperties, sourceValues))
                         {
-                            processedCount++;
+                            System.Threading.Interlocked.Increment(ref processedCount);
                         }
+                        System.Threading.Interlocked.Increment(ref currentMaterial);
+                        float progress = (float)currentMaterial / totalMaterials;
+                        EditorUtility.DisplayProgressBar("マテリアルの更新", 
+                            $"{currentMaterial}/{totalMaterials} マテリアルを処理中...", progress);
                     });
                 }
                 else
                 {
                     foreach (var material in targetMaterials)
                     {
-                        if (CopyPropertiesToMaterial(sourceMaterial, material, selectedProperties))
+                        if (CopyPropertiesToMaterial(sourceMaterial, material, selectedProperties, sourceValues))
                         {
                             processedCount++;
                         }
+                        currentMaterial++;
+                        float progress = (float)currentMaterial / totalMaterials;
+                        EditorUtility.DisplayProgressBar("マテリアルの更新", 
+                            $"{currentMaterial}/{totalMaterials} マテリアルを処理中...", progress);
                     }
                 }
+                
+                EditorUtility.ClearProgressBar();
 
                 // アセットを保存
                 AssetDatabase.SaveAssets();
@@ -543,9 +632,56 @@ namespace LilToonCloner
             }
             catch (Exception ex)
             {
+                EditorUtility.ClearProgressBar();
                 LilToonClonerUtils.LogError($"プロパティのコピー中にエラーが発生しました: {ex.Message}");
                 return processedCount;
             }
+        }
+
+        /// <summary>
+        /// ソースマテリアルからプロパティ値をキャッシュする
+        /// </summary>
+        private Dictionary<string, object> CacheSourceMaterialProperties(Material source, List<PropertyInfo> properties)
+        {
+            Dictionary<string, object> values = new Dictionary<string, object>();
+            
+            foreach (var property in properties)
+            {
+                try
+                {
+                    switch (property.Type)
+                    {
+                        case MaterialPropertyType.Int:
+                            values[property.Key] = source.GetInt(property.Key);
+                            break;
+                        case MaterialPropertyType.Float:
+                            values[property.Key] = source.GetFloat(property.Key);
+                            break;
+                        case MaterialPropertyType.Color:
+                            values[property.Key] = source.GetColor(property.Key);
+                            break;
+                        case MaterialPropertyType.Vector:
+                            values[property.Key] = source.GetVector(property.Key);
+                            break;
+                        case MaterialPropertyType.Texture:
+                            values[property.Key] = source.GetTexture(property.Key);
+                            if (source.HasProperty(property.Key + "_ST"))
+                            {
+                                values[property.Key + "_ST"] = source.GetVector(property.Key + "_ST");
+                            }
+                            break;
+                        case MaterialPropertyType.Cube:
+                            values[property.Key] = source.GetTexture(property.Key);
+                            break;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"プロパティ '{property.Key}' のキャッシュ中にエラー: {ex.Message}");
+                }
+            }
+            
+            return values;
         }
 
         /// <summary>
@@ -554,8 +690,10 @@ namespace LilToonCloner
         /// <param name="source">コピー元マテリアル</param>
         /// <param name="target">コピー先マテリアル</param>
         /// <param name="selectedProperties">コピーするプロパティリスト</param>
+        /// <param name="sourceValues">キャッシュされたソース値</param>
         /// <returns>コピーが成功したかどうか</returns>
-        private bool CopyPropertiesToMaterial(Material source, Material target, List<PropertyInfo> selectedProperties)
+        private bool CopyPropertiesToMaterial(Material source, Material target, List<PropertyInfo> selectedProperties, 
+            Dictionary<string, object> sourceValues)
         {
             if (source == null || target == null) return false;
 
@@ -571,30 +709,41 @@ namespace LilToonCloner
             {
                 if (!target.HasProperty(property.Key)) continue;
 
-                switch (property.Type)
+                try
                 {
-                    case MaterialPropertyType.Int:
-                        target.SetInt(property.Key, source.GetInt(property.Key));
-                        break;
-                    case MaterialPropertyType.Float:
-                        target.SetFloat(property.Key, source.GetFloat(property.Key));
-                        break;
-                    case MaterialPropertyType.Color:
-                        target.SetColor(property.Key, source.GetColor(property.Key));
-                        break;
-                    case MaterialPropertyType.Vector:
-                        target.SetVector(property.Key, source.GetVector(property.Key));
-                        break;
-                    case MaterialPropertyType.Texture:
-                        target.SetTexture(property.Key, source.GetTexture(property.Key));
-                        if (source.HasProperty(property.Key + "_ST"))
-                        {
-                            target.SetVector(property.Key + "_ST", source.GetVector(property.Key + "_ST"));
-                        }
-                        break;
-                    case MaterialPropertyType.Cube:
-                        target.SetTexture(property.Key, source.GetTexture(property.Key));
-                        break;
+                    if (!sourceValues.TryGetValue(property.Key, out object value))
+                        continue;
+
+                    switch (property.Type)
+                    {
+                        case MaterialPropertyType.Int:
+                            target.SetInt(property.Key, (int)value);
+                            break;
+                        case MaterialPropertyType.Float:
+                            target.SetFloat(property.Key, (float)value);
+                            break;
+                        case MaterialPropertyType.Color:
+                            target.SetColor(property.Key, (Color)value);
+                            break;
+                        case MaterialPropertyType.Vector:
+                            target.SetVector(property.Key, (Vector4)value);
+                            break;
+                        case MaterialPropertyType.Texture:
+                            target.SetTexture(property.Key, (Texture)value);
+                            if (target.HasProperty(property.Key + "_ST") && 
+                                sourceValues.TryGetValue(property.Key + "_ST", out object stValue))
+                            {
+                                target.SetVector(property.Key + "_ST", (Vector4)stValue);
+                            }
+                            break;
+                        case MaterialPropertyType.Cube:
+                            target.SetTexture(property.Key, (Texture)value);
+                            break;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"プロパティ '{property.Key}' のコピー中にエラー: {ex.Message}");
                 }
             }
 
